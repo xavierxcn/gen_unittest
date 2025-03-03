@@ -2,10 +2,12 @@ import os
 import tempfile
 import subprocess
 import re
-from typing import Dict, Any, Tuple
+import json
+from typing import Dict, Any, Tuple, Optional
 from metagpt.roles import Role
 from metagpt.schema import Message
 from metagpt.actions import Action
+from metagpt.logs import logger
 
 
 class TestValidationAction(Action):
@@ -86,7 +88,7 @@ class TestValidationAction(Action):
         Returns:
             (语法是否有效, 错误信息)
         """
-        # 简单的语法检查
+        # 根据文件类型选择验证方法
         if file_ext == '.java':
             return self._validate_java_syntax(test_code)
         elif file_ext == '.kt':
@@ -104,18 +106,65 @@ class TestValidationAction(Action):
         Returns:
             (语法是否有效, 错误信息)
         """
-        # 简单的语法检查
+        # 使用临时文件和javac进行语法检查
+        with tempfile.NamedTemporaryFile(suffix='.java', delete=False) as temp_file:
+            temp_file_path = temp_file.name
+            try:
+                # 写入测试代码到临时文件
+                with open(temp_file_path, 'w', encoding='utf-8') as f:
+                    f.write(test_code)
+                
+                # 尝试使用javac编译
+                if self._is_command_available('javac'):
+                    result = subprocess.run(
+                        ['javac', '-Xlint:all', temp_file_path],
+                        capture_output=True,
+                        text=True
+                    )
+                    
+                    if result.returncode == 0:
+                        return True, ""
+                    else:
+                        return False, result.stderr
+                else:
+                    # 如果javac不可用，回退到基本语法检查
+                    return self._basic_java_syntax_check(test_code)
+            except Exception as e:
+                return False, f"验证Java语法时出错: {str(e)}"
+            finally:
+                # 清理临时文件
+                try:
+                    os.unlink(temp_file_path)
+                except:
+                    pass
+    
+    def _basic_java_syntax_check(self, test_code: str) -> Tuple[bool, str]:
+        """基本的Java语法检查，当javac不可用时使用"""
+        errors = []
+        
         # 检查括号是否匹配
         if test_code.count('{') != test_code.count('}'):
-            return False, "Java语法错误: 花括号不匹配"
+            errors.append("花括号不匹配")
+        
+        if test_code.count('(') != test_code.count(')'):
+            errors.append("圆括号不匹配")
+        
+        if test_code.count('[') != test_code.count(']'):
+            errors.append("方括号不匹配")
         
         # 检查分号
         lines = test_code.split('\n')
         for i, line in enumerate(lines):
             line = line.strip()
             if line and not line.startswith('//') and not line.startswith('/*') and not line.startswith('*') and not line.endswith('{') and not line.endswith('}') and not line.endswith(';') and not line.startswith('@') and not line.startswith('package') and not line.startswith('import'):
-                return False, f"Java语法错误: 第{i+1}行缺少分号: {line}"
+                errors.append(f"第{i+1}行可能缺少分号: {line}")
         
+        # 检查类定义
+        if not re.search(r'class\s+\w+', test_code):
+            errors.append("缺少类定义")
+        
+        if errors:
+            return False, "Java语法错误: " + "; ".join(errors)
         return True, ""
 
     def _validate_kotlin_syntax(self, test_code: str) -> Tuple[bool, str]:
@@ -128,12 +177,71 @@ class TestValidationAction(Action):
         Returns:
             (语法是否有效, 错误信息)
         """
-        # 简单的语法检查
+        # 使用临时文件和kotlinc进行语法检查
+        with tempfile.NamedTemporaryFile(suffix='.kt', delete=False) as temp_file:
+            temp_file_path = temp_file.name
+            try:
+                # 写入测试代码到临时文件
+                with open(temp_file_path, 'w', encoding='utf-8') as f:
+                    f.write(test_code)
+                
+                # 尝试使用kotlinc编译
+                if self._is_command_available('kotlinc'):
+                    result = subprocess.run(
+                        ['kotlinc', temp_file_path],
+                        capture_output=True,
+                        text=True
+                    )
+                    
+                    if result.returncode == 0:
+                        return True, ""
+                    else:
+                        return False, result.stderr
+                else:
+                    # 如果kotlinc不可用，回退到基本语法检查
+                    return self._basic_kotlin_syntax_check(test_code)
+            except Exception as e:
+                return False, f"验证Kotlin语法时出错: {str(e)}"
+            finally:
+                # 清理临时文件
+                try:
+                    os.unlink(temp_file_path)
+                except:
+                    pass
+    
+    def _basic_kotlin_syntax_check(self, test_code: str) -> Tuple[bool, str]:
+        """基本的Kotlin语法检查，当kotlinc不可用时使用"""
+        errors = []
+        
         # 检查括号是否匹配
         if test_code.count('{') != test_code.count('}'):
-            return False, "Kotlin语法错误: 花括号不匹配"
+            errors.append("花括号不匹配")
         
+        if test_code.count('(') != test_code.count(')'):
+            errors.append("圆括号不匹配")
+        
+        if test_code.count('[') != test_code.count(']'):
+            errors.append("方括号不匹配")
+        
+        # 检查类定义或函数定义
+        if not re.search(r'class\s+\w+', test_code) and not re.search(r'fun\s+\w+', test_code):
+            errors.append("缺少类或函数定义")
+        
+        if errors:
+            return False, "Kotlin语法错误: " + "; ".join(errors)
         return True, ""
+    
+    def _is_command_available(self, command: str) -> bool:
+        """检查命令是否可用"""
+        try:
+            subprocess.run(
+                [command, '--version'], 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.PIPE
+            )
+            return True
+        except:
+            return False
 
     def _validate_python_execution(self, test_code: str, framework: str) -> Tuple[bool, str]:
         """
@@ -149,33 +257,30 @@ class TestValidationAction(Action):
         # 创建临时文件
         with tempfile.NamedTemporaryFile(suffix='.py', delete=False) as temp_file:
             temp_file_path = temp_file.name
-            temp_file.write(test_code.encode('utf-8'))
-
-        try:
-            # 执行测试
-            if framework == "pytest":
-                cmd = ["pytest", "-xvs", temp_file_path]
-            else:  # unittest
-                cmd = ["python", temp_file_path]
-
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=10  # 设置超时时间
-            )
-
-            # 检查执行结果
-            if result.returncode == 0:
-                return True, result.stdout
-            else:
-                return False, f"退出代码: {result.returncode}\n标准输出: {result.stdout}\n标准错误: {result.stderr}"
-        except Exception as e:
-            return False, f"执行测试时出错: {str(e)}"
-        finally:
-            # 删除临时文件
-            if os.path.exists(temp_file_path):
-                os.unlink(temp_file_path)
+            try:
+                # 写入测试代码到临时文件
+                with open(temp_file_path, 'w', encoding='utf-8') as f:
+                    f.write(test_code)
+                
+                # 根据测试框架选择执行命令
+                if framework == 'pytest':
+                    cmd = ['pytest', temp_file_path, '-v']
+                else:  # unittest
+                    cmd = ['python', '-m', 'unittest', temp_file_path]
+                
+                # 执行测试
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                
+                # 返回执行结果
+                return result.returncode == 0, result.stdout + '\n' + result.stderr
+            except Exception as e:
+                return False, f"执行测试时出错: {str(e)}"
+            finally:
+                # 清理临时文件
+                try:
+                    os.unlink(temp_file_path)
+                except:
+                    pass
 
 
 class TestValidator(Role):
@@ -184,9 +289,10 @@ class TestValidator(Role):
     def __init__(self, name="TestValidator"):
         super().__init__(name=name)
         self.description = "我验证生成的测试代码的语法和执行情况。"
-        self.add_action(TestValidationAction())
+        self.validation_action = TestValidationAction()
+        self.set_action(self.validation_action)
 
-    async def validate_tests(self, test_info: Dict[str, Any]) -> Message:
+    async def validate_tests(self, test_info: Dict[str, Any]) -> Dict[str, Any]:
         """
         验证测试代码
 
@@ -194,13 +300,10 @@ class TestValidator(Role):
             test_info: 测试信息，包含测试代码和相关元数据
 
         Returns:
-            包含验证结果的消息
+            包含验证结果的字典
         """
-        validation_action = self.get_action(TestValidationAction)
-        validation_result = await validation_action.run(test_info)
+        # 直接使用保存的action实例，而不是通过get_action获取
+        validation_result = await self.validation_action.run(test_info)
 
-        return Message(
-            content=f"完成对测试代码的验证",
-            cause_by=validation_action,
-            meta=validation_result
-        )
+        # 直接返回验证结果
+        return validation_result
